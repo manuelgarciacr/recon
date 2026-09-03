@@ -1,66 +1,66 @@
 #!/usr/bin/env bash
 
+set -o nounset
+
 # Definir la limpieza al salir (EXIT) o recibir señales de interrupción (INT, TERM)
-trap 'exec 6>&-; exec 7>&-; rm -f "$tmp"' EXIT INT TERM
+trap 'rm -f "$tmp"' EXIT INT TERM
 tmp=$(mktemp)
 
 usage() {
     cat <<EOF
-Usage: $0 <folder> [options]
+Usage: $0 [options] <folder>
 
 <folder>: Folder with the results. It cannot start with a hyphen.
 
 options:
-  --clean-folder         Remove data in the folder. No confirmation
+  --clean-folder         Remove data from previous runs. The folder must exist
   --domain DOMAIN, -d    Domain
   --help, -h             Show command line options
-  --modules, -m          Modules to use: "fierce,dnsrecon,rn_certificate_transparency,rn_hackertarget,rn_brute_hosts"
+  --modules, -m          Modules to use: 'fierce,dnsrecon,rn_certificate_transparency,rn_hackertarget,rn_brute_hosts'. If none are declared, all will be used.
   --only-active, -a      Run only active scans
   --only-passive, -s     Run only passive scans (silent)
-  --overwrite-data       Adds/overwrites the results obtained. No confirmation
+  --reuse-data           Reuse data from previous runs if any. The folder must exist
   --verbose, -v			 Verbose
 
 Examples:
   $0 exampleFolder -d example.com -m fierce,rn_hackertarget --only-passive 
   # Folder exampleFolder, domain example.com, uses only the module rn_hackertarget
-  $0 --domain example.com --overwrite-data exampleFolder
+  $0 --domain example.com --reuse-data exampleFolder
   # Domain example.com, adds/overwrites new results inside the folder, folder exampleFolder
 EOF
 }
 #  -r, --range RANGE      IP Range
 
+declare -A MODULES=( ["fierce"]=1 ["dnsrecon"]=1 ["rn_certificate_transparency"]=1 \
+	["rn_hackertarget"]=1 ["rn_brute_hosts"]=1 )
+declare -A MODULES_TYPE=( ["fierce"]=1 ["dnsrecon"]=1 ["rn_certificate_transparency"]=0 \
+	["rn_hackertarget"]=0 ["rn_brute_hosts"]=1 ) # 1 active, 0 passive
+
 CLEAN_FOLDER=0;
 DOMAIN="";
-MODULES="";
-MOD_FIERCE=1
-MOD_DNSRECON=1
-MOD_RN_CERTIFICATE_TRANSPARENCY=1
-MOD_RN_HACKERTARGET=1
-MOD_RN_BRUTE_HOSTS=1
+MODULES_PARM="";
 ONLY_ACTIVE=0;
 ONLY_PASSIVE=0;
-OVERWRITE_DATA=0;
+REUSE_DATA=0;
 VERBOSE=0;
 DOTOOL="xdotool"
-if [ "$#" -eq 0 ]; then
-	usage
-	$DOTOOL type "$0 "
-    exit 0
-else
-	FOLDER="$1"
-	shift
-fi   
 ARGS=$(LC_ALL=C getopt \
-	--long clean-folder,domain:,help,modules:,only-active,only-passive,overwrite-data,verbose \
+	--long clean-folder,domain:,help,modules:,only-active,only-passive,reuse-data,verbose \
 	-o d:hm:asv \
 	-n "$0" \
 	-- "$@" \
-	2>&1
+	2>"$tmp"
 )
 OPTERROR=$?
 
 main() {
 	testEnv # exit 2, 3
+	echo "**$ARGS**"
+	if [ "$#" -eq 0 ]; then
+		usage
+		$DOTOOL type "$0 "
+    	exit 0
+	fi   
 	args # exit 0, 1
 	recon
 }
@@ -68,14 +68,11 @@ main() {
 # error 2: Options error
 # error 3: dotool not installed
 testEnv() {
-	
-	validate_folder
-
-	if [ $OPTERROR -ne 0 ]; then
-		error 2 $ARG # Options error
+	if [[ $OPTERROR -ne 0 ]]; then
+		error 2 "$(cat $tmp | sed '1!s/^/❌ /')" # Options error
 	fi
 
-	if [ -n "$WAYLAND_DISPLAY" ]; then 
+	if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then 
 		if ! command -v ydotool &> /dev/null; then
 			error 3 "ydotool" # ydotool is not installed
 		fi
@@ -87,26 +84,6 @@ testEnv() {
 	    error 3 "xdotool" # xdotool is not installed
 	fi
 }
-
-# error 20: The folder name cannot be empty
-# error 21: The folder name can only contain letters, numbers, '_' and '-'
-# error 22: Folder name should not start with '-'
-validate_folder() {
-    if [ -z "$FOLDER" ]; then
-        error 20 # The folder name cannot be empty
-    fi
-
-    if [[ ! "$FOLDER" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        error 21 # The folder name can only contain letters, numbers, '_' and '-'
-    fi
-
-    if [[ "$FOLDER" =~ ^[-.] ]]; then
-        error 22 # Folder name should not start with '-'
-    fi
-
-    return 0
-}
-
 
 # error 4: Unknown arguments: $@
 # error 5: Error processing arguments: '$@'
@@ -128,7 +105,7 @@ args() {
 		        exit 0
 		        ;;
 			--modules|-m)
-				MODULES="$2"
+				MODULES_PARM="$2"
 				shift
 				;;
 		    --only-active|-a)
@@ -137,8 +114,8 @@ args() {
 			--only-passive|-s)
 				ONLY_PASSIVE=1
 				;;
-			--overwrite-data)
-				OVERWRITE_DATA=1
+			--reuse-data)
+				REUSE_DATA=1
 				;;
 #		    --range|-r)
 #		        RANGE="$2"
@@ -149,9 +126,16 @@ args() {
 				;;
 		    --)
 		        shift
-		    	if [[ -z "$@" ]]; then
+		    	if [ "$#" -eq 0 ]; then # FILE argument
+			    	echo -e "\a❌ Missing <file> argument"
+			    	exit 1
+		    	fi
+		    	if [ "$#" -eq 1 ]; then # FILE argument exists. OK
+					FOLDER="$1"
+					validate_folder
 			        break
 		    	fi
+				shift
 		    	error 4 $@ # Unknown arguments: $@
 		        ;;
 
@@ -170,52 +154,57 @@ args() {
 		error 7
 	fi
 
-	if [[ "$CLEAN_FOLDER$OVERWRITE_DATA" -eq "11" ]];then
+	if [[ "$CLEAN_FOLDER$REUSE_DATA" -eq "11" ]];then
 		error 8
 	fi
 
-	if [[ -n $MODULES ]]; then
-		MOD_FIERCE=0
-		MOD_DNSRECON=0
-		MOD_RN_CERTIFICATE_TRANSPARENCY=0
-		MOD_RN_HACKERTARGET=0
-		MOD_RN_BRUTE_HOSTS=0
+	if [[ -n $MODULES_PARM ]]; then
+		for key in "${!MODULES[@]}"; do
+  			MODULES["$key"]=0
+		done
 
-		IFS=',' read -ra array <<< "$MODULES"
+		IFS=',' read -ra array <<< "$MODULES_PARM"
 
 		for module in "${array[@]}"; do
-			case "${module,,}" in
-				"fierce")
-					MOD_FIERCE=1
-					;;
-				"dnsrecon")
-					MOD_DNSRECON=1
-					;;
-				"rn_certificate_transparency")
-					MOD_RN_CERTIFICATE_TRANSPARENCY=1
-					;;
-				"rn_hackertarget")
-					MOD_RN_HACKERTARGET=1
-					;;
-				"rn_brute_hosts")
-					MOD_RN_BRUTE_HOSTS=1
-					;;
-				*)
-					error 9 "$module"
-			esac
+			[[ -v MODULES["$module"] ]] && MODULES["$module"]=1 || error 9 "$module" # Module '$2' does not exist"
 		done
 	fi
+
 	if [[ $ONLY_ACTIVE -eq 1 ]]; then
-		MOD_RN_CERTIFICATE_TRANSPARENCY=0
-		MOD_RN_HACKERTARGET=0
+		for key in "${!MODULES[@]}"; do
+			if [[ MODULES_TYPE["$key"] -eq 0 ]]; then
+  				MODULES["$key"]=0
+			fi
+		done
 	fi
 	if [[ $ONLY_PASSIVE -eq 1 ]]; then
-		MOD_FIERCE=0
-		MOD_DNSRECON=0
-		MOD_RN_BRUTE_HOSTS=0
+		for key in "${!MODULES[@]}"; do
+			if [[ MODULES_TYPE["$key"] -eq 1 ]]; then
+  				MODULES["$key"]=0
+			fi
+		done
 	fi
-	(( MOD_FIERCE + MOD_DNSRECON + MOD_RN_CERTIFICATE_TRANSPARENCY + \
-		MOD_RN_HACKERTARGET + MOD_RN_BRUTE_HOSTS == 0 )) && error 10
+	local total=0
+	for key in "${!MODULES[@]}"; do
+  		total=$(( total + MODULES["$key"] ))
+	done
+	[[ $total -eq 0 ]] && error 10 # No modules selected
+}
+
+validate_folder() {
+    if [ -z "$FOLDER" ]; then
+        error 20 # The folder name cannot be empty
+    fi
+
+    if [[ ! "$FOLDER" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        error 21 # The folder name can only contain letters, numbers, '_' and '-'
+    fi
+
+    if [[ "$FOLDER" =~ ^[-.] ]]; then
+        error 22 # Folder name should not start with '-'
+    fi
+
+    return 0
 }
 
 # create_folder() {
@@ -244,16 +233,17 @@ gap() {
 }
 
 recon() {
-	echo -e "\n$(date '+%Y-%m-%d %H:%M:%S')\nPID: $$" | tee -a "$FOLDER/recon.log"
-
+	echo -e "\n$(date '+%Y-%m-%d %H:%M:%S')\nPID: $$\n" | tee -a "$FOLDER/recon.log"
 
 	if [[ -e $FOLDER && $CLEAN_FOLDER -eq 1 ]]; then
 		rm -rf "$(realpath "$FOLDER")" >> "$FOLDER/recon.log" 2>"$tmp"
 		mkdir -p "$FOLDER" >> "$FOLDER/recon.log" 2>>"$tmp"
-	elif [[ -e $FOLDER && $OVERWRITE_DATA -eq 0 ]]; then
-		error 11
-	elif [[ ! -e $FOLDER ]]; then
-		mkdir "$FOLDER" >> "$FOLDER/recon.log" 2>"$tmp"
+		mkdir -p "$FOLDER/DATA" >> "$FOLDER/recon.log" 2>>"$tmp"
+	elif [[ -e $FOLDER && $REUSE_DATA -eq 0 ]]; then
+		error 11 # The folder '$FOLDER' already exists
+	elif [[ ! -e $FOLDER || ! -e "$FOLDER/DATA" ]]; then
+		mkdir -p "$FOLDER" >> "$FOLDER/recon.log" 2>"$tmp"
+		mkdir -p "$FOLDER/DATA" >> "$FOLDER/recon.log" 2>>"$tmp"
 	fi
 	cat "$tmp" | tee -a "$FOLDER/recon.log"
 
@@ -263,37 +253,35 @@ recon() {
 	[[ -f $FOLDER/fierce-nearby.csv ]] && rm "$(realpath "$FOLDER")/fierce-nearby.csv" >> "$FOLDER/recon.log" 2>>"$tmp"
 	cat "$tmp" | tee -a "$FOLDER/recon.log"
 
-	fierce 0 # Param 0 or any: dont search for new data
- 	dnsrecon 0
+	fierce
+ 	dnsrecon
 	recon_ng 
 
 	gap "outputs"
+
 	echo
-	#sort -t'|' -k1,4 -u $FOLDER/recon.csv > $FOLDER/recon-unique.csv
-	#awk -F'|' 'BEGIN{OFS="|"} {temp=$2; $2=$3; $3=temp; print}' $FOLDER/recon.csv | grep -Ev '^[|]' | sort -t'|' -k1,4 -u > $FOLDER/recon-ip.csv
-	#sort -t'|' -k2,2 -u $FOLDER/recon-ip.csv > $FOLDER/recon-ip-unique.csv
 	
-	[[ -f $FOLDER/recon.csv ]] && echo "#...$(wc -l $FOLDER/recon.csv)"
-	[[ -f $FOLDER/hosts.csv ]] && echo "#...$(wc -l $FOLDER/hosts.csv)"
-	[[ -f $FOLDER/fierce-nearby.csv ]] && echo "#...$(wc -l $FOLDER/fierce-nearby.csv)"
-	#echo "#...$(wc -l $FOLDER/recon-unique.csv)"
-	#echo "#...$(wc -l $FOLDER/recon-ip.csv)"
-	#echo "#...$(wc -l $FOLDER/recon-ip-unique.csv)"
+	[[ -f $FOLDER/recon.csv ]] && echo "#...$(wc -l $FOLDER/recon.csv)" 2>&1 | tee -a "$FOLDER/recon.log"
+	[[ -f $FOLDER/hosts.csv ]] && echo "#...$(wc -l $FOLDER/hosts.csv)" 2>&1 | tee -a "$FOLDER/recon.log"
+	[[ -f $FOLDER/fierce-nearby.csv ]] && echo "#...$(wc -l $FOLDER/fierce-nearby.csv)" 2>&1 | tee -a "$FOLDER/recon.log"
 }
 
 fierce() { # Active
-	local searchData=${1:-1}
-	local file="$FOLDER/fierce.txt"
+	local file="$FOLDER/DATA/fierce.txt"
 
-	[[ $MOD_FIERCE -eq 0 ]] && return
+	[[ ${MODULES["fierce"]} -eq 0 ]] && return
 	
 	gap "fierce"
 
-	if [[ $searchData -eq 1 ]]; then
+	if [[ ! -f $file || $REUSE_DATA -eq 0 ]]; then
 		command fierce --domain $DOMAIN > "$file" 2>"$tmp"
+		local date=""
+	else
+		local date=$(red $(stat -c '%w' "$file" | cut -c1-16))
 	fi
+
 	if ! [[ -f $file ]]; then
-		echo -e "\n#...$file: does not exist"
+		echo -e "\n#...$file: does not exist" 2>&1 | tee -a "$FOLDER/recon.log"
 		return
 	fi
 
@@ -311,26 +299,30 @@ fierce() { # Active
 	local sorted=$(sort -t'|' -k1,3 -u $FOLDER/hosts.csv)
 	echo "$sorted" > $FOLDER/hosts.csv
 
-	echo -e "\n#...$(wc -l <<< "$lines") $file"
+	echo -e "\n#...$(wc -l <<< "$lines") $file $date" 2>&1 | tee -a "$FOLDER/recon.log"
 	cat "$tmp" | tee -a "$FOLDER/recon.log"
 }
 
 dnsrecon() { # Active
-	local searchData=${1:-1}
-	local file="$FOLDER/dnsrecon.txt"
+	local file="$FOLDER/DATA/dnsrecon.txt"
 
-	[[ $MOD_DNSRECON -eq 0 ]] && return
+	[[ ${MODULES["dnsrecon"]} -eq 0 ]] && return
+
 	if [ "$VERBOSE" -eq 1 ]; then 
 		local v="-v" 
 	fi
 	
 	gap "dnsrecon"
 
-	if [[ $searchData -eq 1 ]]; then
-		command dnsrecon -c $FOLDER/dnsrecon.txt -d $DOMAIN $v 2>"$tmp"
+	if [[ ! -f $file || $REUSE_DATA -eq 0 ]]; then
+		command dnsrecon -c $file -d $DOMAIN $v 2>"$tmp"
+		local date=""
+	else
+		local date=$(red $(stat -c '%w' "$file" | cut -c1-16))
 	fi
+
 	if ! [[ -f $file ]]; then
-		echo -e "\n#...$file: does not exist"
+		echo -e "\n#...$file: does not exist" 2>&1 | tee -a "$FOLDER/recon.log"
 		return
 	fi
 
@@ -355,34 +347,36 @@ dnsrecon() { # Active
 	local sorted=$(sort -t'|' -k1,3 -u $FOLDER/hosts.csv)
 	echo "$sorted" > $FOLDER/hosts.csv
 
-	echo -e "\n#...$(wc -l <<< "$lines") $file"
+	echo -e "\n#...$(wc -l <<< "$lines") $file $date" 2>&1 | tee -a "$FOLDER/recon.log"
 	cat "$tmp" | tee -a "$FOLDER/recon.log"
 }
 
 recon_ng() {
-	recon_ng_run "hosts" "certificate_transparency" 0 # Param 0 or any: dont search for new data
-	recon_ng_run "hosts" "hackertarget" 0
+	recon_ng_run "hosts" "certificate_transparency"
+	recon_ng_run "hosts" "hackertarget"
 	recon_ng_run "hosts" "brute_hosts"
 }
 
 recon_ng_run() {
 	local table="$1"
 	local module="$2"
-	local searchData=${3:-1}
-	local file="$(realpath $FOLDER)/rn_${module}.csv"
+	local file="$FOLDER/DATA/rn_${module}.csv"
 
-	local name="MOD_RN_${module^^}"
-	local val="${!name}"
-	[[ $val -eq 0 ]] && return
+	[[ ${MODULES["rn_$module"]} -eq 0 ]] && return
 
 	gap "recon_ng_${module}"
-	if [[ $searchData -eq 1 ]]; then
+
+	if [[ ! -f $file || $REUSE_DATA -eq 0 ]]; then
 		recon-cli -w $FOLDER -C "options set TIMEOUT 30" -C "marketplace install recon/domains-hosts/${module}" -m recon/domains-hosts/${module} -o SOURCE=$DOMAIN -x >> "$FOLDER/recon.log" 2>"$tmp"
 		recon-cli -w $FOLDER -C "marketplace install recon/hosts-hosts/resolve" -m recon/hosts-hosts/resolve -x >> "$FOLDER/recon.log" 2>"$tmp"
 		recon_ng_report "$table" "$module" "$file"
+		local date=""
+	else
+		local date=$(red $(stat -c '%w' "$file" | cut -c1-16))
 	fi
+
 	if ! [[ -f $file ]]; then
-		echo -e "\n#...$file: does not exist"
+		echo -e "\n#...$file: does not exist" 2>&1 | tee -a "$FOLDER/recon.log"
 		return
 	fi
 
@@ -390,14 +384,14 @@ recon_ng_run() {
 
 	#local cnt=$(recon-cli -w $FOLDER -C "db query SELECT COUNT(*) FROM hosts WHERE module='certificate_transparency'" 2>/dev/null | grep "^  | " | grep -oP '\d+')
 	#echo -e "\n#...${cnt} recon-ng certificate_transparency"
-	echo -e "\n#...$(wc -l $file)"
+	echo -e "\n#...$(wc -l $file) $date" 2>&1 | tee -a "$FOLDER/recon.log"
 	cat "$tmp" | tee -a "$FOLDER/recon.log"
 }
 
 recon_ng_report() {
 	local table="$1"
 	local module="$2"
-	local file="$3"
+	local file=$(realpath "$3")   
 
 	recon-cli -w $FOLDER -C "marketplace install reporting/csv" -m reporting/csv \
 		-o FILENAME="$file" \
@@ -460,7 +454,7 @@ error() {
 			MSG="The domain name cannot be empty"
 			;;
 		"8")
-			MSG="The --clean-folder and --overwrite-data options are not compatible with each other"
+			MSG="The --clean-folder and --reuse-data options are not compatible with each other"
 			;;
 		"9")
 			MSG="Module '$2' does not exist"
@@ -488,6 +482,10 @@ error() {
 	exit $CODE
 }
 
-main
+red() {
+	echo -e "\e[1;31m$@\e[0m"
+}
+
+main "$@"
 
 exit 0
