@@ -146,6 +146,26 @@ args() {
 	fi
 }
 
+# create_folder() {
+#     local base="$FOLDER"
+#     local i=0
+#     while [[ -e "$FOLDER" ]]; do
+# 		((i++))
+#         if [ $i -gt 999 ]; then
+# 	    	FOLDER="${base}_${i}"
+# 		else
+#     		local num="000${i}"
+#     		FOLDER="${base}_${num: -3}"
+#         fi
+#     done
+#     if [[ "$base" != "$FOLDER" ]]; then
+# 		confirm "The folder exists, do you want to use the '$FOLDER' folder?" && \
+# 			mkdir "$FOLDER" || exit
+# 	else
+# 		mkdir "$FOLDER"
+# 	fi
+# }
+
 create_folder() {
     local base="$FOLDER"
     local i=1

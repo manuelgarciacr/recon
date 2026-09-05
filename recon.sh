@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -o nounset
+shopt -s lastpipe
 
 # Definir la limpieza al salir (EXIT) o recibir señales de interrupción (INT, TERM)
 trap 'rm -f "$tmp"' EXIT INT TERM
@@ -8,25 +9,26 @@ tmp=$(mktemp)
 
 usage() {
     cat <<EOF
-Usage: $0 [options] <folder>
+Usage: $0 [options] <workspace>
 
-<folder>: Folder with the results. It cannot start with a hyphen.
+<workspace>: Workspace name for recon-ng and folder with the results. It cannot start with a hyphen.
 
 options:
-  --clean-folder         Remove data from previous runs. The folder must exist
+  --clean-workspace      Remove data from previous runs if any.
   --domain DOMAIN, -d    Domain
   --help, -h             Show command line options
-  --modules, -m          Modules to use: 'fierce,dnsrecon,rn_certificate_transparency,rn_hackertarget,rn_brute_hosts'. If none are declared, all will be used.
+  --log, -l              Log file. By default 'recon.log'
+  --modules, -m          Modules to use: 'fierce, dnsrecon, rn_certificate_transparency, rn_hackertarget, rn_brute_hosts'. If none are declared, all will be used.
   --only-active, -a      Run only active scans
   --only-passive, -s     Run only passive scans (silent)
-  --reuse-data           Reuse data from previous runs if any. The folder must exist
+  --reuse_workspace      Reuse data from previous runs if any. The folder and the workspace must exist
   --verbose, -v			 Verbose
 
 Examples:
-  $0 exampleFolder -d example.com -m fierce,rn_hackertarget --only-passive 
-  # Folder exampleFolder, domain example.com, uses only the module rn_hackertarget
-  $0 --domain example.com --reuse-data exampleFolder
-  # Domain example.com, adds/overwrites new results inside the folder, folder exampleFolder
+  $0 -d example.com -m fierce,rn_hackertarget --only-passive myworkspace 
+  # FWorkspace myworkspace, domain example.com, uses only the module rn_hackertarget because fierce is considered active
+  $0 --domain example.com myworkspace --reuse_workspace
+  # Domain example.com, workspace myworkspace, reuse data from previous runs
 EOF
 }
 #  -r, --range RANGE      IP Range
@@ -36,17 +38,23 @@ declare -A MODULES=( ["fierce"]=1 ["dnsrecon"]=1 ["rn_certificate_transparency"]
 declare -A MODULES_TYPE=( ["fierce"]=1 ["dnsrecon"]=1 ["rn_certificate_transparency"]=0 \
 	["rn_hackertarget"]=0 ["rn_brute_hosts"]=1 ) # 1 active, 0 passive
 
-CLEAN_FOLDER=0;
+CLEAN_WORKSPACE=0;
 DOMAIN="";
+DOTOOL="xdotool"
+FOLDER="";
+LOG="recon.log";
+LOGEXISTS=0
 MODULES_PARM="";
 ONLY_ACTIVE=0;
 ONLY_PASSIVE=0;
-REUSE_DATA=0;
+RECON_NG=0;
+REUSE_WORKSPACE=0;
+TEST="";
 VERBOSE=0;
-DOTOOL="xdotool"
+
 ARGS=$(LC_ALL=C getopt \
-	--long clean-folder,domain:,help,modules:,only-active,only-passive,reuse-data,verbose \
-	-o d:hm:asv \
+	--long clean-workspace,domain:,help,log:,modules:,only-active,only-passive,reuse-workspace,verbose \
+	-o d:hl:m:asv \
 	-n "$0" \
 	-- "$@" \
 	2>"$tmp"
@@ -54,19 +62,19 @@ ARGS=$(LC_ALL=C getopt \
 OPTERROR=$?
 
 main() {
-	testEnv # exit 2, 3
-	echo "**$ARGS**"
-	if [ "$#" -eq 0 ]; then
+	testEnv
+
+	if [[ $# -eq 0 ]]; then
 		usage
 		$DOTOOL type "$0 "
-    	exit 0
+    	[[ -z $TEST ]] && exit 0 || return 0
 	fi   
-	args # exit 0, 1
+
+	args
+	environment
 	recon
 }
 
-# error 2: Options error
-# error 3: dotool not installed
 testEnv() {
 	if [[ $OPTERROR -ne 0 ]]; then
 		error 2 "$(cat $tmp | sed '1!s/^/❌ /')" # Options error
@@ -85,16 +93,13 @@ testEnv() {
 	fi
 }
 
-# error 4: Unknown arguments: $@
-# error 5: Error processing arguments: '$@'
-# error 6: The --only-active and --only-passive options are not compatible with each other
 args() {
 	eval set -- "$ARGS"
 	
 	while true; do
 		case "$1" in
-			--clean-folder)
-				CLEAN_FOLDER=1
+			--clean-workspace)
+				CLEAN_WORKSPACE=1
 				;;
 		    --domain|-d)
 		        DOMAIN="$2"
@@ -102,8 +107,12 @@ args() {
 		        ;;
 		    --help|-h)
 		        usage
-		        exit 0
+		        [[ -z $TEST ]] && exit 0 || return 0
 		        ;;
+			--log|-l)
+				LOG="$2"
+				shift
+				;;
 			--modules|-m)
 				MODULES_PARM="$2"
 				shift
@@ -114,31 +123,28 @@ args() {
 			--only-passive|-s)
 				ONLY_PASSIVE=1
 				;;
-			--reuse-data)
-				REUSE_DATA=1
+			--reuse-workspace)
+				REUSE_WORKSPACE=1
 				;;
-#		    --range|-r)
-#		        RANGE="$2"
-#		        shift 2
-#		        ;;
+			--test--)
+				TEST=1
+				;;
 			--verbose|-v)
 				VERBOSE=1
 				;;
 		    --)
 		        shift
 		    	if [ "$#" -eq 0 ]; then # FILE argument
-			    	echo -e "\a❌ Missing <file> argument"
-			    	exit 1
+					error 13 # Missing <folder> argument
 		    	fi
 		    	if [ "$#" -eq 1 ]; then # FILE argument exists. OK
 					FOLDER="$1"
-					validate_folder
+					validate_folder # At this point, the --log option has already been read
 			        break
 		    	fi
 				shift
 		    	error 4 $@ # Unknown arguments: $@
 		        ;;
-
 		    *)
 		        error 5 $@ # Error processing arguments: '$@'
 		        ;;
@@ -151,11 +157,11 @@ args() {
 	fi
 
 	if [[ -z "$DOMAIN" ]]; then
-		error 7
+		error 7 # The domain name cannot be empty
 	fi
 
-	if [[ "$CLEAN_FOLDER$REUSE_DATA" -eq "11" ]];then
-		error 8
+	if [[ "$CLEAN_WORKSPACE$REUSE_WORKSPACE" -eq "11" ]];then
+		error 8 # The --clean-workspace and --reuse_workspace options are not compatible with each other
 	fi
 
 	if [[ -n $MODULES_PARM ]]; then
@@ -177,6 +183,7 @@ args() {
 			fi
 		done
 	fi
+
 	if [[ $ONLY_PASSIVE -eq 1 ]]; then
 		for key in "${!MODULES[@]}"; do
 			if [[ MODULES_TYPE["$key"] -eq 1 ]]; then
@@ -184,14 +191,18 @@ args() {
 			fi
 		done
 	fi
-	local total=0
+
+	local existModule=0
 	for key in "${!MODULES[@]}"; do
-  		total=$(( total + MODULES["$key"] ))
+		[[ ${MODULES[$key]} -eq 1 ]] && existModule=1
+		[[ $key == rn_* ]] && RECON_NG=1  
 	done
-	[[ $total -eq 0 ]] && error 10 # No modules selected
+
+	[[ $existModule -eq 0 ]] && error 10 # No modules selected
 }
 
 validate_folder() {
+	
     if [ -z "$FOLDER" ]; then
         error 20 # The folder name cannot be empty
     fi
@@ -204,54 +215,56 @@ validate_folder() {
         error 22 # Folder name should not start with '-'
     fi
 
-    return 0
+	if [[ -z "$LOG" || "$LOG" == "." || "$LOG" == ".." || "$LOG" == */* ]]; then
+    	error 23 "$LOG" # Invalid log file name
+	fi
+
+	LOG="$FOLDER/$LOG"
 }
 
-# create_folder() {
-#     local base="$FOLDER"
-#     local i=0
-#     while [[ -e "$FOLDER" ]]; do
-# 		((i++))
-#         if [ $i -gt 999 ]; then
-# 	    	FOLDER="${base}_${i}"
-# 		else
-#     		local num="000${i}"
-#     		FOLDER="${base}_${num: -3}"
-#         fi
-#     done
-#     if [[ "$base" != "$FOLDER" ]]; then
-# 		confirm "The folder exists, do you want to use the '$FOLDER' folder?" && \
-# 			mkdir "$FOLDER" || exit
-# 	else
-# 		mkdir "$FOLDER"
-# 	fi
-# }
+environment() {
+	local log=$(echo -e "\n$(date '+%Y-%m-%d %H:%M:%S')\nPID: $$\n")
+	touch "$tmp"
 
-gap() {
-	sleep 2
-	echo -e "\n$1 ..." | tee -a "$FOLDER/recon.log"
+	_workspace() {
+		[[ -d ~/.recon-ng/workspaces/$FOLDER ]]
+	}
+	_folder() {
+		[[ -d $FOLDER ]]
+	}
+	_recon_ng() {
+		[[ $RECON_NG -eq 1 ]]
+	}
+
+	if [[ $CLEAN_WORKSPACE -eq 1 ]]; then
+		#_folder && log+=$(rm -rf "$(realpath "$FOLDER")" 2>"$tmp")
+		_folder && log+=$(rm -rf "$FOLDER" 2>"$tmp")
+	elif _folder && [[ $REUSE_WORKSPACE -eq 0 ]]; then
+		echo "$log"
+		error 11 # The folder '$FOLDER' already exists
+	elif _workspace && _recon_ng && [[ $REUSE_WORKSPACE -eq 0 ]]; then
+		echo "$log"
+		error 12 # The workspace '$FOLDER' already exists
+	fi
+
+	#_noerror && _workspace && _recon_ng && log+=$(rm -f ~/.recon-ng/workspaces/$FOLDER/data.db 2>"$tmp")
+	_noerror && _workspace && _recon_ng && log+=$(sqlite3 ~/.recon-ng/workspaces/$FOLDER/data.db \
+		"DELETE FROM hosts; DELETE FROM hosts;" 2>"$tmp")
+	_noerror && log+=$(mkdir -p "$FOLDER/DATA" 2>"$tmp")
+	#_noerror && ! [[ -f "$LOG" ]] && log+=$(touch "$LOG" 2>"$tmp")
+	_noerror && [[ -f $FOLDER/recon.csv ]] && log+=$(rm "$FOLDER/recon.csv" 2>"$tmp")
+	_noerror && [[ -f $FOLDER/hosts.csv ]] && log+=$(rm "$FOLDER/hosts.csv" 2>"$tmp")
+	_noerror && [[ -f $FOLDER/fierce-nearby.csv ]] && log+=$(rm "$FOLDER/fierce-nearby.csv" 2>"$tmp")
+
+	echo "$log"
+	! _noerror && error 24 "$(cat $tmp)" # Can not actualize the environment
+
+	LOGEXISTS=1
+
+	echo "$log" | toLog -q
 }
 
 recon() {
-	echo -e "\n$(date '+%Y-%m-%d %H:%M:%S')\nPID: $$\n" | tee -a "$FOLDER/recon.log"
-
-	if [[ -e $FOLDER && $CLEAN_FOLDER -eq 1 ]]; then
-		rm -rf "$(realpath "$FOLDER")" >> "$FOLDER/recon.log" 2>"$tmp"
-		mkdir -p "$FOLDER" >> "$FOLDER/recon.log" 2>>"$tmp"
-		mkdir -p "$FOLDER/DATA" >> "$FOLDER/recon.log" 2>>"$tmp"
-	elif [[ -e $FOLDER && $REUSE_DATA -eq 0 ]]; then
-		error 11 # The folder '$FOLDER' already exists
-	elif [[ ! -e $FOLDER || ! -e "$FOLDER/DATA" ]]; then
-		mkdir -p "$FOLDER" >> "$FOLDER/recon.log" 2>"$tmp"
-		mkdir -p "$FOLDER/DATA" >> "$FOLDER/recon.log" 2>>"$tmp"
-	fi
-	cat "$tmp" | tee -a "$FOLDER/recon.log"
-
-	recon-cli -w $FOLDER -C "db query DELETE FROM domains" -C "db query DELETE FROM hosts" >> "$FOLDER/recon.log" 2>"$tmp"
-	[[ -f $FOLDER/recon.csv ]] && rm "$(realpath "$FOLDER")/recon.csv" >> "$FOLDER/recon.log" 2>>"$tmp"
-	[[ -f $FOLDER/hosts.csv ]] && rm "$(realpath "$FOLDER")/hosts.csv" >> "$FOLDER/recon.log" 2>>"$tmp"
-	[[ -f $FOLDER/fierce-nearby.csv ]] && rm "$(realpath "$FOLDER")/fierce-nearby.csv" >> "$FOLDER/recon.log" 2>>"$tmp"
-	cat "$tmp" | tee -a "$FOLDER/recon.log"
 
 	fierce
  	dnsrecon
@@ -261,9 +274,9 @@ recon() {
 
 	echo
 	
-	[[ -f $FOLDER/recon.csv ]] && echo "#...$(wc -l $FOLDER/recon.csv)" 2>&1 | tee -a "$FOLDER/recon.log"
-	[[ -f $FOLDER/hosts.csv ]] && echo "#...$(wc -l $FOLDER/hosts.csv)" 2>&1 | tee -a "$FOLDER/recon.log"
-	[[ -f $FOLDER/fierce-nearby.csv ]] && echo "#...$(wc -l $FOLDER/fierce-nearby.csv)" 2>&1 | tee -a "$FOLDER/recon.log"
+	[[ -f $FOLDER/recon.csv ]] && echo "#...$(wc -l $FOLDER/recon.csv)" 2>&1 | toLog
+	[[ -f $FOLDER/hosts.csv ]] && echo "#...$(wc -l $FOLDER/hosts.csv)" 2>&1 | toLog
+	[[ -f $FOLDER/fierce-nearby.csv ]] && echo "#...$(wc -l $FOLDER/fierce-nearby.csv)" 2>&1 | toLog
 }
 
 fierce() { # Active
@@ -273,7 +286,7 @@ fierce() { # Active
 	
 	gap "fierce"
 
-	if [[ ! -f $file || $REUSE_DATA -eq 0 ]]; then
+	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
 		command fierce --domain $DOMAIN > "$file" 2>"$tmp"
 		local date=""
 	else
@@ -281,7 +294,7 @@ fierce() { # Active
 	fi
 
 	if ! [[ -f $file ]]; then
-		echo -e "\n#...$file: does not exist" 2>&1 | tee -a "$FOLDER/recon.log"
+		echo -e "\n#...$file: does not exist" 2>&1 | toLog
 		return
 	fi
 
@@ -299,22 +312,23 @@ fierce() { # Active
 	local sorted=$(sort -t'|' -k1,3 -u $FOLDER/hosts.csv)
 	echo "$sorted" > $FOLDER/hosts.csv
 
-	echo -e "\n#...$(wc -l <<< "$lines") $file $date" 2>&1 | tee -a "$FOLDER/recon.log"
-	cat "$tmp" | tee -a "$FOLDER/recon.log"
+	echo -e "\n#...$(wc -l <<< "$lines") $file $date" 2>&1 | toLog
+	cat "$tmp" | toLog
 }
 
 dnsrecon() { # Active
 	local file="$FOLDER/DATA/dnsrecon.txt"
+	local v=""
 
 	[[ ${MODULES["dnsrecon"]} -eq 0 ]] && return
 
 	if [ "$VERBOSE" -eq 1 ]; then 
-		local v="-v" 
+		v="-v" 
 	fi
 	
 	gap "dnsrecon"
 
-	if [[ ! -f $file || $REUSE_DATA -eq 0 ]]; then
+	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
 		command dnsrecon -c $file -d $DOMAIN $v 2>"$tmp"
 		local date=""
 	else
@@ -322,7 +336,7 @@ dnsrecon() { # Active
 	fi
 
 	if ! [[ -f $file ]]; then
-		echo -e "\n#...$file: does not exist" 2>&1 | tee -a "$FOLDER/recon.log"
+		echo -e "\n#...$file: does not exist" 2>&1 | toLog
 		return
 	fi
 
@@ -347,8 +361,8 @@ dnsrecon() { # Active
 	local sorted=$(sort -t'|' -k1,3 -u $FOLDER/hosts.csv)
 	echo "$sorted" > $FOLDER/hosts.csv
 
-	echo -e "\n#...$(wc -l <<< "$lines") $file $date" 2>&1 | tee -a "$FOLDER/recon.log"
-	cat "$tmp" | tee -a "$FOLDER/recon.log"
+	echo -e "\n#...$(wc -l <<< "$lines") $file $date" 2>&1 | toLog
+	cat "$tmp" | toLog
 }
 
 recon_ng() {
@@ -366,17 +380,17 @@ recon_ng_run() {
 
 	gap "recon_ng_${module}"
 
-	if [[ ! -f $file || $REUSE_DATA -eq 0 ]]; then
-		recon-cli -w $FOLDER -C "options set TIMEOUT 30" -C "marketplace install recon/domains-hosts/${module}" -m recon/domains-hosts/${module} -o SOURCE=$DOMAIN -x >> "$FOLDER/recon.log" 2>"$tmp"
-		recon-cli -w $FOLDER -C "marketplace install recon/hosts-hosts/resolve" -m recon/hosts-hosts/resolve -x >> "$FOLDER/recon.log" 2>"$tmp"
-		recon_ng_report "$table" "$module" "$file"
+	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
 		local date=""
+		recon-cli -w $FOLDER -C "options set TIMEOUT 30" -C "marketplace install recon/domains-hosts/${module}" -m recon/domains-hosts/${module} -o SOURCE=$DOMAIN -x 2>"$tmp" | toLog -q
+		recon-cli -w $FOLDER -C "marketplace install recon/hosts-hosts/resolve" -m recon/hosts-hosts/resolve -x 2>"$tmp" | toLog -q
+		recon_ng_report "$table" "$module" "$file"
 	else
 		local date=$(red $(stat -c '%w' "$file" | cut -c1-16))
 	fi
 
 	if ! [[ -f $file ]]; then
-		echo -e "\n#...$file: does not exist" 2>&1 | tee -a "$FOLDER/recon.log"
+		echo -e "\n#...$file: does not exist" 2>&1 | toLog
 		return
 	fi
 
@@ -384,24 +398,26 @@ recon_ng_run() {
 
 	#local cnt=$(recon-cli -w $FOLDER -C "db query SELECT COUNT(*) FROM hosts WHERE module='certificate_transparency'" 2>/dev/null | grep "^  | " | grep -oP '\d+')
 	#echo -e "\n#...${cnt} recon-ng certificate_transparency"
-	echo -e "\n#...$(wc -l $file) $date" 2>&1 | tee -a "$FOLDER/recon.log"
-	cat "$tmp" | tee -a "$FOLDER/recon.log"
+	echo -e "\n#...$(wc -l $file) $date" 2>&1 | toLog
+	cat "$tmp" | toLog
 }
 
 recon_ng_report() {
 	local table="$1"
 	local module="$2"
-	local file=$(realpath "$3")   
+	local file=$(realpath "$3")
+	local output=""
+	touch "$tmp"
 
 	recon-cli -w $FOLDER -C "marketplace install reporting/csv" -m reporting/csv \
 		-o FILENAME="$file" \
-		-o TABLE=${table} -x >> "$FOLDER/recon.log" 2>"$tmp"
+		-o TABLE=${table} -x 2>"$tmp" | toLog -q
 
-	local output=$(cat "$file" | grep "${module}\".$" | 
+	_noerror && output=$(cat "$file" | grep "${module}\".$" | 
 		sed 's/^"//; s/".$//; s/","/|/g; s/\(.*\)|/\1|recon-ng /')
-	echo "$output" > "$file" 2>"$tmp"
+	_noerror && echo "$output" > "$file" 2>"$tmp"
 
-	cat "$tmp" | tee -a "$FOLDER/recon.log"
+	cat "$tmp" | toLog
 }
 
 recon_ng_populate_hosts() {
@@ -412,7 +428,12 @@ recon_ng_populate_hosts() {
 	local sorted=$(sort -t'|' -k1,3 -u $FOLDER/hosts.csv)
 	echo "$sorted" > $FOLDER/hosts.csv
 
-	cat "$tmp" | tee -a "$FOLDER/recon.log"
+	cat "$tmp" | toLog
+}
+
+gap() {
+	sleep 2
+	echo -e "\n$1 ..." | toLog
 }
 
 confirm() {
@@ -454,7 +475,7 @@ error() {
 			MSG="The domain name cannot be empty"
 			;;
 		"8")
-			MSG="The --clean-folder and --reuse-data options are not compatible with each other"
+			MSG="The --clean-workspace and --reuse_workspace options are not compatible with each other"
 			;;
 		"9")
 			MSG="Module '$2' does not exist"
@@ -465,6 +486,12 @@ error() {
 		"11")
 			MSG="The folder '$FOLDER' already exists"
 			;;
+		"12")
+			MSG="The workspace '$FOLDER' already exists"
+			;;
+		"13")
+			MSG="Missing <folder> argument"
+			;;
 		"20")
 			MSG="The folder name cannot be empty"
 			;;
@@ -474,18 +501,43 @@ error() {
 		"22")
 			MSG="Folder name should not start with '-': '$FOLDER'"
 			;;
+		"23")
+			MSG="Invalid log file name: '$2'"
+			;;
+		"24")
+			MSG="Can not actualize the environment: '$2'"
+			;;
 		*)
 			MSG="$2"
 	esac
 
     echo -e "\a❌ $MSG"
+
+	[[ $LOGEXISTS -eq 1 ]] && echo -e "\a❌ $MSG" >> "$LOG"
+
+	[[ -n $TEST ]] && return $CODE
+
 	exit $CODE
+}
+
+_noerror() {
+	[[ -z "$(cat $tmp)" ]]
+}
+
+toLog() {
+	# This pipe only works if it is the last
+	local logTxt=$(echo "$LOG" | sed 's/\.log$/\.txt\.log/')
+	echo >> "LOG"
+    while IFS= read -r linea; do
+        [[ "${1:-}" == "-q" ]] && echo "$linea" >> "$LOG" || echo "$linea" | tee -a "$LOG"
+		echo "$linea" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' >> "$logTxt"
+    done
 }
 
 red() {
 	echo -e "\e[1;31m$@\e[0m"
 }
 
-main "$@"
-
-exit 0
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
