@@ -18,7 +18,8 @@ options:
   --domain DOMAIN, -d    Domain
   --help, -h             Show command line options
   --log, -l              Log file. By default 'recon.log'
-  --modules, -m          Modules to use: 'fierce, dnsrecon, rn_certificate_transparency, rn_hackertarget, rn_brute_hosts'. If none are declared, all will be used.
+  --modules, -m          Modules to use: 'dnsdumpster, theharvester, fierce, dnsrecon, rn_certificate_transparency, 
+                             rn_hackertarget, rn_brute_hosts'. If none are declared, all will be used.
   --only-active, -a      Run only active scans
   --only-passive, -s     Run only passive scans (silent)
   --reuse_workspace      Reuse data from previous runs if any. The folder and the workspace must exist
@@ -26,16 +27,15 @@ options:
 
 Examples:
   $0 -d example.com -m fierce,rn_hackertarget --only-passive myworkspace 
-  # FWorkspace myworkspace, domain example.com, uses only the module rn_hackertarget because fierce is considered active
+  # Workspace myworkspace, domain example.com, uses only the module rn_hackertarget because fierce is considered active
   $0 --domain example.com myworkspace --reuse_workspace
   # Domain example.com, workspace myworkspace, reuse data from previous runs
 EOF
 }
-#  -r, --range RANGE      IP Range
 
-declare -A MODULES=( ["fierce"]=1 ["dnsrecon"]=1 ["rn_certificate_transparency"]=1 \
+declare -A MODULES=( ["dnsdumpster"]=1 ["theharvester"]=1 ["fierce"]=1 ["dnsrecon"]=1 ["rn_certificate_transparency"]=1 \
 	["rn_hackertarget"]=1 ["rn_brute_hosts"]=1 )
-declare -A MODULES_TYPE=( ["fierce"]=1 ["dnsrecon"]=1 ["rn_certificate_transparency"]=0 \
+declare -A MODULES_TYPE=( ["dnsdumpster"]=0 ["theharvester"]=0 ["fierce"]=1 ["dnsrecon"]=1 ["rn_certificate_transparency"]=0 \
 	["rn_hackertarget"]=0 ["rn_brute_hosts"]=1 ) # 1 active, 0 passive
 
 CLEAN_WORKSPACE=0;
@@ -126,18 +126,15 @@ args() {
 			--reuse-workspace)
 				REUSE_WORKSPACE=1
 				;;
-			--test--)
-				TEST=1
-				;;
 			--verbose|-v)
 				VERBOSE=1
 				;;
 		    --)
 		        shift
-		    	if [ "$#" -eq 0 ]; then # FILE argument
-					error 13 # Missing <folder> argument
+		    	if [ "$#" -eq 0 ]; then
+					error 13 # Missing <workspace> argument
 		    	fi
-		    	if [ "$#" -eq 1 ]; then # FILE argument exists. OK
+		    	if [ "$#" -eq 1 ]; then # workspace argument exists. OK
 					FOLDER="$1"
 					validate_folder # At this point, the --log option has already been read
 			        break
@@ -204,15 +201,15 @@ args() {
 validate_folder() {
 	
     if [ -z "$FOLDER" ]; then
-        error 20 # The folder name cannot be empty
+        error 20 # The workspace cannot be empty
     fi
 
     if [[ ! "$FOLDER" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        error 21 # The folder name can only contain letters, numbers, '_' and '-'
+        error 21 # The workspace can only contain letters, numbers, '_' and '-'
     fi
 
     if [[ "$FOLDER" =~ ^[-.] ]]; then
-        error 22 # Folder name should not start with '-'
+        error 22 # The workspace should not start with '-'
     fi
 
 	if [[ -z "$LOG" || "$LOG" == "." || "$LOG" == ".." || "$LOG" == */* ]]; then
@@ -224,7 +221,7 @@ validate_folder() {
 
 environment() {
 	local log=$(echo -e "\n$(date '+%Y-%m-%d %H:%M:%S')\nPID: $$\n")
-	touch "$tmp"
+	> "$tmp"
 
 	_workspace() {
 		[[ -d ~/.recon-ng/workspaces/$FOLDER ]]
@@ -251,9 +248,11 @@ environment() {
 	_noerror && _workspace && _recon_ng && log+=$(sqlite3 ~/.recon-ng/workspaces/$FOLDER/data.db \
 		"DELETE FROM hosts; DELETE FROM hosts;" 2>"$tmp")
 	_noerror && log+=$(mkdir -p "$FOLDER/DATA" 2>"$tmp")
-	#_noerror && ! [[ -f "$LOG" ]] && log+=$(touch "$LOG" 2>"$tmp")
+	#_noerror && ! [[ -f "$LOG" ]] && log+=$(> "$LOG" 2>"$tmp")
 	_noerror && [[ -f $FOLDER/recon.csv ]] && log+=$(rm "$FOLDER/recon.csv" 2>"$tmp")
+	_noerror && [[ -f $FOLDER/hosts-ips.csv ]] && log+=$(rm "$FOLDER/hosts-ips.csv" 2>"$tmp")
 	_noerror && [[ -f $FOLDER/hosts.csv ]] && log+=$(rm "$FOLDER/hosts.csv" 2>"$tmp")
+	_noerror && [[ -f $FOLDER/ips.csv ]] && log+=$(rm "$FOLDER/ips.csv" 2>"$tmp")
 	_noerror && [[ -f $FOLDER/fierce-nearby.csv ]] && log+=$(rm "$FOLDER/fierce-nearby.csv" 2>"$tmp")
 
 	echo "$log"
@@ -266,6 +265,8 @@ environment() {
 
 recon() {
 
+	dnsdumpster
+	#theharvester
 	fierce
  	dnsrecon
 	recon_ng 
@@ -273,10 +274,102 @@ recon() {
 	gap "outputs"
 
 	echo
-	
+
 	[[ -f $FOLDER/recon.csv ]] && echo "#...$(wc -l $FOLDER/recon.csv)" 2>&1 | toLog
-	[[ -f $FOLDER/hosts.csv ]] && echo "#...$(wc -l $FOLDER/hosts.csv)" 2>&1 | toLog
+	[[ -f $FOLDER/hosts-ips.csv ]] && echo "#...$(wc -l $FOLDER/hosts-ips.csv)" 2>&1 | toLog
+	[[ -f $FOLDER/hosts.csv ]] && echo "#...$(cat "$FOLDER/hosts.csv" | tr ',' '\n' | grep -c '') $FOLDER/hosts.csv" 2>&1 | toLog
+	[[ -f $FOLDER/ips.csv ]] && echo "#...$(cat "$FOLDER/ips.csv" | tr ',' '\n' | grep -c '') $FOLDER/ips.csv" 2>&1 | toLog
 	[[ -f $FOLDER/fierce-nearby.csv ]] && echo "#...$(wc -l $FOLDER/fierce-nearby.csv)" 2>&1 | toLog
+}
+
+dnsdumpster() { # Passive
+	local file="$FOLDER/DATA/dnsdumpster.json"
+	local key=$(sqlite3 ~/.recon-ng/keys.db "SELECT value FROM keys WHERE name='dnsdumpster_api'")
+	local cmd=(curl -H "X-API-Key: $key" "https://api.dnsdumpster.com/domain/$DOMAIN")
+
+	[[ ${MODULES["dnsdumpster"]} -eq 0 ]] && return
+	
+	gap "dnsdumpster"
+
+	> "$tmp"
+
+	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
+		command "${cmd[@]}" > "$file" 2>"$tmp"
+		#{
+  		#	"error": "Invalid domain"
+		#}
+		local date=""
+	else
+		local date=$(stat -c '%w' "$file" | cut -c1-16)
+	fi
+
+	if ! [[ -f $file ]]; then
+		echo -e "\n#...$file: does not exist" 2>&1 | toLog
+		return
+	fi
+
+	local lines=$(parseJSON.sh --parseDNSDumpster --no-header --no-quotes "$file")
+	local output=$(echo "$lines" | grep -Ev '^txt\|' |
+		awk -F'|' -v OFS='|' '{
+			if ($7 == "https") 		 $7 = "443"
+    		else if ($7 == "http")   $7 = "80"
+    		else if ($7 == "ftp")    $7 = "21"
+    		else if ($7 == "ssh")    $7 = "22"
+    		else if ($7 == "telnet") $7 = "23"
+			print tolower($1), $2, $3, $7, $11, "dnsdumpster"
+			}')
+	local output2=$(echo "$lines" | grep -E '^txt\|' |
+		awk -F'|' -v OFS='|' '{print tolower($1), $2, $3, $7, $12, "dnsdumpster"}')
+
+	[[ -n $output && -n $output2 ]] && output+=$'\n'"$output2" || output+="$output2"
+
+	echo "$output" >> $FOLDER/recon.csv
+
+	# echo "$output" | awk -F'|' -v OFS='|' '{print $3, $2, $4, $6}' | 
+	# 	grep -v "^||" >> $FOLDER/hosts-ips.csv
+
+	depure_output
+
+	# TODO: Count the number of effective records
+	date=$(red $(echo "$date"))
+	echo -e "\n#...$(wc -l <<< "$lines") $file $date" 2>&1 | toLog
+	cat "$tmp" | toLog
+}
+
+theharvester() { # Passive
+	local file="$FOLDER/DATA/theharvester.json"
+	local key=$(sqlite3 ~/.recon-ng/keys.db "SELECT value FROM keys WHERE name='dnsdumpster_api'")
+
+	[[ ${MODULES["theharvester"]} -eq 0 ]] && return
+	
+	gap "theharvester"
+
+	> "$tmp"
+
+	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
+		command theHarvester -d $DOMAIN -b crtsh,securityTrails,virustotal,dnsdumpster,duckduckgo,yahoo,brave -l 1000 -f "$file" 2>"$tmp"
+		local output=$?
+		#{
+  		#	"error": "Invalid domain"
+		#}
+		local date=""
+	else
+		local date=$(stat -c '%w' "$file" | cut -c1-16)
+	fi
+
+	if ! [[ -f $file ]]; then
+		echo -e "\n#...$file: does not exist" 2>&1 | toLog
+		return
+	fi
+
+	local lines=$(cat "$file" | jq '.')
+
+	depure_output
+
+	# TODO: Count the number of effective records
+	date=$(red $(echo "$date"))
+	echo -e "\n#...$(wc -l <<< "$lines") $file $date" 2>&1 | toLog
+	cat "$tmp" | toLog
 }
 
 fierce() { # Active
@@ -286,11 +379,13 @@ fierce() { # Active
 	
 	gap "fierce"
 
+	> "$tmp"
+
 	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
 		command fierce --domain $DOMAIN > "$file" 2>"$tmp"
 		local date=""
 	else
-		local date=$(red $(stat -c '%w' "$file" | cut -c1-16))
+		local date=$(stat -c '%w' "$file" | cut -c1-16)
 	fi
 
 	if ! [[ -f $file ]]; then
@@ -301,17 +396,22 @@ fierce() { # Active
 	local lines=$(grep -E "^SOA:|^Found:" "$file")
 
 	echo "$lines" | sed -E \
-		-e 's/^Found: ([^ ]+) \(([^)]+)\)/\2|\1/' \
-		-e 's/^SOA: ([^ ]+) \(([^)]+)\)/\2|\1/' |
-		sed -e 's/\.$//' | sed -e 's/$/||fierce/' >> $FOLDER/hosts.csv
+		-e 's/^Found: ([^ ]+) \(([^)]+)\)/|\1|\2/' \
+		-e 's/^SOA: ([^ ]+) \(([^)]+)\)/soa|\1|\2/' |
+		sed -e 's/\.$//' | sed -e 's/$/|||fierce/' | sed 's/\.|/|/g' >> $FOLDER/recon.csv
+
+	# echo "$lines" | sed -E \
+	# 	-e 's/^Found: ([^ ]+) \(([^)]+)\)/\2|\1/' \
+	# 	-e 's/^SOA: ([^ ]+) \(([^)]+)\)/\2|\1/' |
+	# 	sed -e 's/\.$//' | sed -e 's/$/||fierce/' >> $FOLDER/hosts-ips.csv
 	
 	grep -E "^[[:space:]]*\{?'[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+':" "$file" |
 		sed -E -e "s/^[[:space:]]*\{?'([^']+)': '([^']+)'.*/\1|\2/" |
 		sed 's/\.$//' > $FOLDER/fierce-nearby.csv
 
-	local sorted=$(sort -t'|' -k1,3 -u $FOLDER/hosts.csv)
-	echo "$sorted" > $FOLDER/hosts.csv
+	depure_output
 
+	date=$(red $(echo "$date"))
 	echo -e "\n#...$(wc -l <<< "$lines") $file $date" 2>&1 | toLog
 	cat "$tmp" | toLog
 }
@@ -328,11 +428,13 @@ dnsrecon() { # Active
 	
 	gap "dnsrecon"
 
+	> "$tmp"
+
 	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
 		command dnsrecon -c $file -d $DOMAIN $v 2>"$tmp"
 		local date=""
 	else
-		local date=$(red $(stat -c '%w' "$file" | cut -c1-16))
+		local date=$(stat -c '%w' "$file" | cut -c1-16)
 	fi
 
 	if ! [[ -f $file ]]; then
@@ -343,24 +445,23 @@ dnsrecon() { # Active
 	local lines=$(grep -Ev "^Domain," "$file" | 
 		cut -d "," -f 2,3,4,5,6,7 --output-delimiter='|')
 
-	local output=$(echo "$lines" | grep -Ev '^SRV\||^TXT\|' | 
-			sed 's/$/dnsrecon/';
+	local output=$(
+		echo "$lines" | grep -Ev '^SRV\||^TXT\|' | 
+			#sed 's/$/dnsrecon/';
+			awk -F'|' -v OFS='|' '{print tolower($1), $2, $3, $4, $5, "dnsrecon"}';
 		echo "$lines" | grep -E '^SRV\|' |
-			awk -F'|' -v OFS='|' '{print $1, $4, $3, $5, $2, "dnsrecon"}';
+			awk -F'|' -v OFS='|' '{print tolower($1), $4, $3, $5, $2, "dnsrecon"}';
 		echo "$lines" | grep -E '^TXT\|' |
-			awk -F'|' -v OFS='|' '{print $1, $4, $3, $5, $6, "dnsrecon"}' | 
+			awk -F'|' -v OFS='|' '{print tolower($1), $4, $3, $5, $6, "dnsrecon"}' | 
 			sed "s/|'/|/" | sed "s/'|/|/")
 	echo "$output" >> $FOLDER/recon.csv
-	
-	echo "$output" | awk -F'|' -v OFS='|' '{print $3, $2, $4, $6}' | 
-		grep -v "^||" >> $FOLDER/hosts.csv
 
-	local sorted=$(sort -t'|' -k1,5 -u $FOLDER/recon.csv)
-	echo "$sorted" > $FOLDER/recon.csv
+	# echo "$output" | awk -F'|' -v OFS='|' '{print $3, $2, $4, $6}' | 
+	# 	grep -v "^||" >> $FOLDER/hosts-ips.csv
 
-	local sorted=$(sort -t'|' -k1,3 -u $FOLDER/hosts.csv)
-	echo "$sorted" > $FOLDER/hosts.csv
+	depure_output
 
+	date=$(red $(echo "$date"))
 	echo -e "\n#...$(wc -l <<< "$lines") $file $date" 2>&1 | toLog
 	cat "$tmp" | toLog
 }
@@ -380,13 +481,15 @@ recon_ng_run() {
 
 	gap "recon_ng_${module}"
 
+	> "$tmp"
+
 	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
 		local date=""
 		recon-cli -w $FOLDER -C "options set TIMEOUT 30" -C "marketplace install recon/domains-hosts/${module}" -m recon/domains-hosts/${module} -o SOURCE=$DOMAIN -x 2>"$tmp" | toLog -q
 		recon-cli -w $FOLDER -C "marketplace install recon/hosts-hosts/resolve" -m recon/hosts-hosts/resolve -x 2>"$tmp" | toLog -q
 		recon_ng_report "$table" "$module" "$file"
 	else
-		local date=$(red $(stat -c '%w' "$file" | cut -c1-16))
+		local date=$(stat -c '%w' "$file" | cut -c1-16)
 	fi
 
 	if ! [[ -f $file ]]; then
@@ -398,6 +501,7 @@ recon_ng_run() {
 
 	#local cnt=$(recon-cli -w $FOLDER -C "db query SELECT COUNT(*) FROM hosts WHERE module='certificate_transparency'" 2>/dev/null | grep "^  | " | grep -oP '\d+')
 	#echo -e "\n#...${cnt} recon-ng certificate_transparency"
+	date=$(red $(echo "$date"))
 	echo -e "\n#...$(wc -l $file) $date" 2>&1 | toLog
 	cat "$tmp" | toLog
 }
@@ -407,7 +511,7 @@ recon_ng_report() {
 	local module="$2"
 	local file=$(realpath "$3")
 	local output=""
-	touch "$tmp"
+	> "$tmp"
 
 	recon-cli -w $FOLDER -C "marketplace install reporting/csv" -m reporting/csv \
 		-o FILENAME="$file" \
@@ -423,12 +527,61 @@ recon_ng_report() {
 recon_ng_populate_hosts() {
 	local file="$1"
 	
-	cat "$file" | awk -F'|' -v OFS='|' '{print $2, $1, "", $8}' >>"$FOLDER/hosts.csv" 2>"$tmp"
+	cat "$file" | awk -F'|' -v OFS='|' '{print "", $1, $2, "", "", $8}' >>"$FOLDER/recon.csv" 2>"$tmp"
+	#cat "$file" | awk -F'|' -v OFS='|' '{print $2, $1, "", $8}' >>"$FOLDER/hosts-ips.csv" 2>"$tmp"
 
-	local sorted=$(sort -t'|' -k1,3 -u $FOLDER/hosts.csv)
-	echo "$sorted" > $FOLDER/hosts.csv
+	depure_output
 
 	cat "$tmp" | toLog
+}
+
+depure_output()  {
+	local type host ip port misc origen
+	local newRecon newHostIp newIp newHost
+	local sorted
+
+	while IFS='|' read -r type host ip port misc origen; do
+		local key="$type|$host|$ip|$port|$misc"
+		if [[ -n "$host|$ip|$port|$misc" && "${newRecon:-}" != *"$key"* ]]; then
+			newRecon+="$type|$host|$ip|$port|$misc|$origen"$'\n'
+		fi
+	done < $FOLDER/recon.csv
+
+	newRecon="${newRecon%$'\n'}"
+	sorted=$(echo "${newRecon:-}" | sort -t'|' -k1,5 -u)
+	echo "$sorted" > $FOLDER/recon.csv
+
+	while IFS='|' read -r type host ip port misc origen; do
+		local key="$host|$ip|$port|"
+		if [[ -n "$port" && "${newHostIp:-}" != *"$key"* ]]; then
+			newHostIp+="$host|$ip|$port|$origen"$'\n'
+		fi
+		key="|$host|"
+		[[ -n "$host"  && "${newHost:-}" != *"$key"*  ]] && newHost+="$host"$'\n'
+		key="|$ip|"
+		[[ -n "$ip"  && "${newIp:-}" != *"$key"* ]] && newIp+="$ip"$'\n'
+	done < $FOLDER/recon.csv
+	
+	newHost="${newHost%$'\n'}"
+	sorted=$(echo "${newHost:-}" | sort -t',' -k1 -u | tr '\n' ',' | sed 's/,$//')
+	echo "$sorted" > $FOLDER/hosts.csv
+
+	newIp="${newIp%$'\n'}"
+	sorted=$(echo "${newIp:-}" | sort -t',' -k1 -u | tr '\n' ',' | sed 's/,$//')
+	echo "$sorted" > $FOLDER/ips.csv
+
+	while IFS='|' read -r type host ip port misc origen; do
+		if [[ -z "$port" ]]; then
+			local key="$host|$ip|"
+			if [[ "${newHostIp:-}" != *"$key"* ]]; then
+				newHostIp+="$host|$ip||$origen"$'\n'
+			fi
+		fi
+	done < $FOLDER/recon.csv
+
+	newHostIp="${newHostIp%$'\n'}"   
+	sorted=$(echo "${newHostIp:-}" | sort -t'|' -k1,3 -u)
+	echo "$sorted" > $FOLDER/hosts-ips.csv
 }
 
 gap() {
@@ -454,9 +607,9 @@ error() {
 	fi
 
 	case "$1" in
-		"1")
-			MSG="Folder name starts with hyphen: '$2'"
-			;;
+		#"1")
+		#	MSG="Folder name starts with hyphen: '$2'"
+		#	;;
 		"3")
 			MSG="$2 is not installed"
 			;;
@@ -490,16 +643,16 @@ error() {
 			MSG="The workspace '$FOLDER' already exists"
 			;;
 		"13")
-			MSG="Missing <folder> argument"
+			MSG="Missing <workspace> argument"
 			;;
 		"20")
-			MSG="The folder name cannot be empty"
+			MSG="The workspace cannot be empty"
 			;;
 		"21")
-			MSG="The folder name can only contain letters, numbers, '_' and '-': '$FOLDER'"
+			MSG="The workspace can only contain letters, numbers, '_' and '-': '$FOLDER'"
 			;;
 		"22")
-			MSG="Folder name should not start with '-': '$FOLDER'"
+			MSG="The workspace should not start with '-': '$FOLDER'"
 			;;
 		"23")
 			MSG="Invalid log file name: '$2'"
