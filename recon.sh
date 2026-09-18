@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+if [[ $EUID -ne 0 ]]; then
+    exec sudo "$0" "$@"
+fi
+
 set -o nounset
 shopt -s lastpipe
 
@@ -11,23 +15,35 @@ usage() {
     cat <<EOF
 Usage: $0 [options] <workspace>
 
-<workspace>: Workspace name for recon-ng and folder with the results. It cannot start with a hyphen.
+<workspace>: Workspace name for recon-ng and folder with the results. It cannot 
+    start with a hyphen.
+If no domain and no IPs are provided, scans the current network.
 
 options:
-  --clean-workspace      Remove data from previous runs if any.
-  --domain DOMAIN, -d    Domain
-  --help, -h             Show command line options
-  --log, -l              Log file. By default 'recon.log'
-  --modules, -m          Modules to use: 'dnsdumpster, theharvester, fierce, dnsrecon, rn_certificate_transparency, 
-                             rn_hackertarget, rn_brute_hosts'. If none are declared, all will be used.
-  --only-active, -a      Run only active scans
-  --only-passive, -s     Run only passive scans (silent)
-  --reuse_workspace      Reuse data from previous runs if any. The folder and the workspace must exist
-  --verbose, -v			 Verbose
+  --active-recon-mode, -a   Run active host discovery modules
+  --clean-workspace         Remove data from previous runs if any.
+  --domain DOMAIN, -d       Domain. If defined, perimeter domain searches are
+                                performed.
+  --help, -h                Show command line options.
+  --log, -l                 Log file. By default 'recon.log'.
+  --modules, -m             Modules to use: 'dnsdumpster, theharvester, 
+                                fierce, dnsrecon, rn_certificate_transparency, 
+                                rn_hackertarget, rn_brute_hosts'. If none is 
+                                declared, all modules can be used.
+  --noisy-scan-mode, -n     Runs active port scans in noisy mode. (see --stealth-scan-mode)
+  --range, -r               IP range as comma separated values, CIDR or first-
+                                last ip. If IPs are found or defined,
+                                port scanners will proceed.
+  --reuse_workspace         Reuse data from previous runs if any. The folder
+                                and the workspace must exist.
+  --stealth-scan-mode, -s   Runs active port scans in stealth mode. (see --noisy-scan-mode)
+  --verbose, -v             Verbose.
 
 Examples:
-  $0 -d example.com -m fierce,rn_hackertarget --only-passive myworkspace 
-  # Workspace myworkspace, domain example.com, uses only the module rn_hackertarget because fierce is considered active
+  $0 -d example.com -m fierce,rn_hackertarget myworkspace 
+  # Workspace myworkspace, domain example.com, uses only the module 
+      rn_hackertarget because fierce is considered active and needs 
+      the --active flag
   $0 --domain example.com myworkspace --reuse_workspace
   # Domain example.com, workspace myworkspace, reuse data from previous runs
 EOF
@@ -38,6 +54,7 @@ declare -A MODULES=( ["dnsdumpster"]=1 ["theharvester"]=1 ["fierce"]=1 ["dnsreco
 declare -A MODULES_TYPE=( ["dnsdumpster"]=0 ["theharvester"]=0 ["fierce"]=1 ["dnsrecon"]=1 ["rn_certificate_transparency"]=0 \
 	["rn_hackertarget"]=0 ["rn_brute_hosts"]=1 ) # 1 active, 0 passive
 
+ACTIVE_RECON_MODE=0;
 CLEAN_WORKSPACE=0;
 DOMAIN="";
 DOTOOL="xdotool"
@@ -45,16 +62,16 @@ FOLDER="";
 LOG="recon.log";
 LOGEXISTS=0
 MODULES_PARM="";
-ONLY_ACTIVE=0;
-ONLY_PASSIVE=0;
+NOISY_SCAN_MODE=0;
 RECON_NG=0;
 REUSE_WORKSPACE=0;
+STEALTH_SCAN_MODE=0;
 TEST="";
 VERBOSE=0;
 
 ARGS=$(LC_ALL=C getopt \
-	--long clean-workspace,domain:,help,log:,modules:,only-active,only-passive,reuse-workspace,verbose \
-	-o d:hl:m:asv \
+	--long active-recon-mode,clean-workspace,domain:,help,log:,modules:,noisy-scan-mode,range,reuse-workspace,stealth-scan-mode,verbose \
+	-o ad:hl:m:nr:sv \
 	-n "$0" \
 	-- "$@" \
 	2>"$tmp"
@@ -72,7 +89,14 @@ main() {
 
 	args
 	environment
-	recon
+
+	if [[ -n $DOMAIN ]]; then
+		recon
+	else
+		internalRecon
+	fi
+	portsScan
+	servicesScan
 }
 
 testEnv() {
@@ -98,6 +122,9 @@ args() {
 	
 	while true; do
 		case "$1" in
+		    --active-recon-mode|-a)
+				ACTIVE_RECON_MODE=1
+				;;
 			--clean-workspace)
 				CLEAN_WORKSPACE=1
 				;;
@@ -117,14 +144,14 @@ args() {
 				MODULES_PARM="$2"
 				shift
 				;;
-		    --only-active|-a)
-				ONLY_ACTIVE=1
-				;;
-			--only-passive|-s)
-				ONLY_PASSIVE=1
+			--noisy-scan-mode)
+				NOISY_SCAN_MODE=1
 				;;
 			--reuse-workspace)
 				REUSE_WORKSPACE=1
+				;;
+			--stealth-scan-mode)
+				STEALTH_SCAN_MODE=1
 				;;
 			--verbose|-v)
 				VERBOSE=1
@@ -149,13 +176,13 @@ args() {
 		shift
 	done
 
-	if [ "$ONLY_ACTIVE$ONLY_PASSIVE" -eq "11" ]; then
-		error 6 # The --only-active and --only-passive options are not compatible with each other
-	fi
+	# if [ "$ACTIVE_RECON_MODE$ONLY_PASSIVE" -eq "11" ]; then
+	# 	error 6 # The --active-recon-mode and --only-passive options are not compatible with each other
+	# fi
 
-	if [[ -z "$DOMAIN" ]]; then
-		error 7 # The domain name cannot be empty
-	fi
+	# if [[ -z "$DOMAIN" ]]; then
+	# 	error 7 # The domain name cannot be empty
+	# fi
 
 	if [[ "$CLEAN_WORKSPACE$REUSE_WORKSPACE" -eq "11" ]];then
 		error 8 # The --clean-workspace and --reuse_workspace options are not compatible with each other
@@ -173,15 +200,7 @@ args() {
 		done
 	fi
 
-	if [[ $ONLY_ACTIVE -eq 1 ]]; then
-		for key in "${!MODULES[@]}"; do
-			if [[ MODULES_TYPE["$key"] -eq 0 ]]; then
-  				MODULES["$key"]=0
-			fi
-		done
-	fi
-
-	if [[ $ONLY_PASSIVE -eq 1 ]]; then
+	if [[ $ACTIVE_RECON_MODE -eq 0 ]]; then
 		for key in "${!MODULES[@]}"; do
 			if [[ MODULES_TYPE["$key"] -eq 1 ]]; then
   				MODULES["$key"]=0
@@ -196,6 +215,10 @@ args() {
 	done
 
 	[[ $existModule -eq 0 ]] && error 10 # No modules selected
+
+	if [ "$STEALTH_SCAN_MODE$NOISY_SCAN_MODE" -eq "11" ]; then
+		error 14 # The --stealth-scan-mode and --noisy-scan-mode options are not compatible with each other
+	fi
 }
 
 validate_folder() {
@@ -253,6 +276,8 @@ environment() {
 	_noerror && [[ -f $FOLDER/hosts-ips.csv ]] && log+=$(rm "$FOLDER/hosts-ips.csv" 2>"$tmp")
 	_noerror && [[ -f $FOLDER/hosts.csv ]] && log+=$(rm "$FOLDER/hosts.csv" 2>"$tmp")
 	_noerror && [[ -f $FOLDER/ips.csv ]] && log+=$(rm "$FOLDER/ips.csv" 2>"$tmp")
+	_noerror && [[ -f $FOLDER/ips-ports.csv ]] && log+=$(rm "$FOLDER/ips-ports.csv" 2>"$tmp")
+	_noerror && [[ -f $FOLDER/services.csv ]] && log+=$(rm "$FOLDER/services.csv" 2>"$tmp")
 	_noerror && [[ -f $FOLDER/fierce-nearby.csv ]] && log+=$(rm "$FOLDER/fierce-nearby.csv" 2>"$tmp")
 
 	echo "$log"
@@ -556,18 +581,16 @@ depure_output()  {
 		if [[ -n "$port" && "${newHostIp:-}" != *"$key"* ]]; then
 			newHostIp+="$host|$ip|$port|$origen"$'\n'
 		fi
-		key="|$host|"
-		[[ -n "$host"  && "${newHost:-}" != *"$key"*  ]] && newHost+="$host"$'\n'
-		key="|$ip|"
-		[[ -n "$ip"  && "${newIp:-}" != *"$key"* ]] && newIp+="$ip"$'\n'
+		[[ -n "$host"  && "${newHost:-}" != *"$host"*  ]] && newHost+="$host"$'\n'
+		[[ -n "$ip"  && "${newIp:-}" != *"$ip"* ]] && newIp+="$ip"$'\n'
 	done < $FOLDER/recon.csv
 	
 	newHost="${newHost%$'\n'}"
-	sorted=$(echo "${newHost:-}" | sort -t',' -k1 -u | tr '\n' ',' | sed 's/,$//')
+	sorted=$(echo "${newHost:-}" | sort -k1,1 -u | tr '\n' ',' | sed 's/,$//')
 	echo "$sorted" > $FOLDER/hosts.csv
 
 	newIp="${newIp%$'\n'}"
-	sorted=$(echo "${newIp:-}" | sort -t',' -k1 -u | tr '\n' ',' | sed 's/,$//')
+	sorted=$(echo "${newIp:-}" | sort -k1,1 -u | tr '\n' ',' | sed 's/,$//')
 	echo "$sorted" > $FOLDER/ips.csv
 
 	while IFS='|' read -r type host ip port misc origen; do
@@ -582,6 +605,163 @@ depure_output()  {
 	newHostIp="${newHostIp%$'\n'}"   
 	sorted=$(echo "${newHostIp:-}" | sort -t'|' -k1,3 -u)
 	echo "$sorted" > $FOLDER/hosts-ips.csv
+}
+
+internalRecon() {
+	local file="$FOLDER/DATA/internalRecon.csv"
+
+	gap "internalRecon"
+
+	> "$tmp"
+
+	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
+		command ip neigh show > "$file" 2>"$tmp"
+		if [[ $STEALTH_SCAN_MODE -eq 1 ||  $NOISY_SCAN_MODE -eq 1 ]]; then
+			command sudo arp-scan -i 200 -r 1 -R -q -x -A 0102030405060708 --localnet >> "$file" 2>"$tmp"
+		fi
+		local date=""
+	else
+		local date=$(stat -c '%w' "$file" | cut -c1-16)
+	fi
+
+	if ! [[ -f $file ]]; then
+		echo -e "\n#...$file: does not exist" 2>&1 | toLog
+		return
+	fi
+
+	cat "$file" | awk '{print $1}' | sort -k1,1 -u | tr '\n' ',' | sed 's/,$//' >> $FOLDER/ips.csv
+
+	date=$(red $(echo "$date"))
+	echo -e "\n#...$(wc -l < "$file") $file $date" 2>&1 | toLog
+	cat "$tmp" | toLog
+}
+
+portsScan() {
+	local file="$FOLDER/DATA/portsScan.csv"
+
+	gap "portsScan"
+
+	> "$tmp"
+	
+	local hosts=$(cat "$FOLDER/ips.csv")
+
+	[[ -z $hosts ]] && error 25 # ips.csv' is empty
+	
+	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
+		command sudo masscan 10.0.2.2,10.0.2.3 \
+  			-p1-1024 \
+  			--rate 50 \
+  			--source-port 53 \
+  			--randomize-hosts \
+  			--retries 1 \
+  			--open \
+  			-oL "$file"
+			--banners 
+			 2>"$tmp"
+		#TODO: --adapter-ip spofed IP if local network
+		#TODO: $STEALTH_SCAN_MODE and $NOISY_SCAN_MODE
+		local date=""
+	else
+		local date=$(stat -c '%w' "$file" | cut -c1-16)
+	fi
+
+	if ! [[ -f $file ]]; then
+		echo -e "\n#...$file: does not exist" 2>&1 | toLog
+		return
+	fi
+
+	local lines=$(cat "$file" | grep "^open")
+	echo "$lines" | awk '{print $4 ":" $3}' | sort -k1,1 -u | tr '\n' ',' | sed 's/,$//' >> $FOLDER/ips-ports.csv
+
+	date=$(red $(echo "$date"))
+	echo -e "\n#...$(echo "$lines" | wc -l) $file $date" 2>&1 | toLog
+	cat "$tmp" | toLog
+}
+
+servicesScan() {
+	local file="$FOLDER/DATA/servicesScan.csv"
+
+	gap "servicesScan"
+
+	> "$tmp"
+	
+	local hosts=$(cat "$FOLDER/ips-ports.csv")
+
+	[[ -z $hosts ]] && error 26 # ips-ports.csv' is empty
+	
+	if [[ ! -f $file || $REUSE_WORKSPACE -eq 0 ]]; then
+		local socket=""
+	
+		while IFS= read -r socket; do
+    		local ip="${socket%%:*}"
+			local port="${socket##*:}"
+			command sudo nmap -sV -Pn \
+  				--source-port 53 \
+  				-f \
+  				--data-length 64 \
+  				--scan-delay 2s \
+  				--max-rate 5 \
+  				-T0 \
+				--append-output \
+  				-p"$port" "$ip" \
+  				-oX "$file" 2>"$tmp"
+			#local cnt=$(echo "$output" | xmllint --xpath 'count(//host)' -)
+		done < <(echo "$hosts" | tr ',' '\n')   
+	
+		#TODO: --adapter-ip spofed IP if local network
+		#TODO: $STEALTH_SCAN_MODE and $NOISY_SCAN_MODE
+		local date=""
+	else
+		local date=$(stat -c '%w' "$file" | cut -c1-16)
+	fi
+
+	if ! [[ -f $file ]]; then
+		echo -e "\n#...$file: does not exist" 2>&1 | toLog
+		return
+	fi
+
+	local xmlArray=()
+	local xml=""
+	local line=""
+
+	while IFS= read -r line; do
+		local eol=$(echo "$line" | grep -E "<?xml version=")
+		if [[ -n $eol && -n $xml ]]; then
+			xmlArray+=("$xml")
+			xml=""
+		fi
+		xml+="$line"
+	done < "$file"
+
+	[[ -n $xml ]] && xmlArray+=("$xml")
+
+	local lines=""
+
+	for xml in "${xmlArray[@]}"; do
+		local cntIps=$(echo "$xml" | xmllint --xpath 'count(//host)' -)
+		local i
+		for i in $(seq 1 $cntIps); do
+			local ip=$(echo "$xml" | xmllint --xpath "string(//host[$i]/address/@addr)" -)
+			local cntPorts=$(echo "$xml" | xmllint --xpath "count(//host[$i]/ports/port)" -)
+			local j
+			for j in $(seq 1 $cntPorts); do
+				local port=$(echo "$xml" | xmllint --xpath "string(//host[$i]/ports/port[$j]/@portid)" -)
+				#/port[state/@state="open"]/@portid
+				local status=$(echo "$xml" | xmllint --xpath "string(//host[$i]/ports/port[$j]/state/@state)" -)
+				local service=$(echo "$xml" | xmllint --xpath "string(//host[$i]/ports/port[$j]/service/@name)" -)
+				local product=$(echo "$xml" | xmllint --xpath "string(//host[$i]/ports/port[$j]/service/@product)" -)
+				local version=$(echo "$xml" | xmllint --xpath "string(//host[$i]/ports/port[$j]/service/@version)" -)
+				lines+="$ip|$port|$status|$service|$product|$version"$'\n'
+			done
+		done
+	done
+
+	lines="${lines%$'\n'}"
+	echo "$lines" >> $FOLDER/services.csv
+
+	date=$(red $(echo "$date"))
+	echo -e "\n#...$(echo "$lines" | wc -l) $file $date" 2>&1 | toLog
+	cat "$tmp" | toLog
 }
 
 gap() {
@@ -621,14 +801,14 @@ error() {
 			shift
 			MSG="Error processing arguments: '$@'"
 			;;
-		"6")
-			MSG="The --only-active and --only-passive options are not compatible with each other"
-			;;
-		"7")
-			MSG="The domain name cannot be empty"
-			;;
+		# "6")
+		# 	MSG="The --active-recon-mode and --only-passive options are not compatible with each other"
+		# 	;;
+		# "7")
+		# 	MSG="The domain name cannot be empty"
+		# 	;;
 		"8")
-			MSG="The --clean-workspace and --reuse_workspace options are not compatible with each other"
+			MSG="The --clean-workspace and --reuse-workspace options are not compatible with each other"
 			;;
 		"9")
 			MSG="Module '$2' does not exist"
@@ -645,6 +825,9 @@ error() {
 		"13")
 			MSG="Missing <workspace> argument"
 			;;
+		"14")
+			MSG="The --stealth-scan-mode and --noisy-scan-mode options are not compatible with each other"
+			;;
 		"20")
 			MSG="The workspace cannot be empty"
 			;;
@@ -659,6 +842,12 @@ error() {
 			;;
 		"24")
 			MSG="Can not actualize the environment: '$2'"
+			;;
+		"25")
+			MSG="'$FOLDER/ips.csv' is empty"
+			;;
+		"26")
+			MSG="'$FOLDER/ips-ports.csv' is empty"
 			;;
 		*)
 			MSG="$2"
@@ -680,7 +869,7 @@ _noerror() {
 toLog() {
 	# This pipe only works if it is the last
 	local logTxt=$(echo "$LOG" | sed 's/\.log$/\.txt\.log/')
-	echo >> "LOG"
+	echo >> "$LOG"
     while IFS= read -r linea; do
         [[ "${1:-}" == "-q" ]] && echo "$linea" >> "$LOG" || echo "$linea" | tee -a "$LOG"
 		echo "$linea" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' >> "$logTxt"
